@@ -56,13 +56,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Runs against the service database from the job-level DATABASE_URL. Before Test so the
+      # migration is exercised on an empty database, and the tests run on a migrated one.
+      - name: Migrate
+        run: npm run migration:run
+
       - name: Test
         run: npm test
-
-      - name: Migrate
-        env:
-          DATABASE_URL: postgres://cami:cami@localhost:5432/cami_app
-        run: npm run migration:run
 
       - name: Build
         run: npm run build

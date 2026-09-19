@@ -10,6 +10,7 @@ What did you tackle first, what did you defer, and why?
   and it can be checked byte-for-byte against the old output.
 - UI freshness second: client-only and small, and the list is now fast enough (~4 ms) that
   refetching it after every mutation is cheap.
+- CI third: a one-line cause, but it interacts with the Postgres-backed test from the first task.
 
 ## Assumptions
 
@@ -72,6 +73,26 @@ What did you tackle first, what did you defer, and why?
 - **Not done:** an automated test. `apps/web` has no test runner, and adding vitest plus a DOM
   environment is a separate decision. `staleTime` / `refetchOnWindowFocus` are left as they are:
   fine for reads once mutations invalidate.
+
+### CI
+
+- **Cause:** the Migrate step overrode `DATABASE_URL` with `.../cami_app`, but the Postgres service
+  only creates `cami` (`POSTGRES_DB: cami`, and every other URL in the repo uses `cami`), so it
+  failed with `database "cami_app" does not exist`. It passes locally because a local
+  `DATABASE_URL` points at `cami`. It was the only failing step; install, typecheck, tests and
+  build were already green on a clean checkout.
+- **Fix:** removed the override so Migrate uses the job-level `DATABASE_URL`, and moved Migrate
+  before Test. The Postgres-backed list test runs the migrations itself in `beforeAll`, so with
+  Migrate after Test both tables already existed when it ran (checked with a probe step): it
+  could never catch a broken migration. Now it runs on an empty database and the tests run on a
+  migrated one.
+- **Verification:** replayed the steps parsed from `ci.yml` against a clean `git archive` of HEAD
+  in a `node:20` container (Node 20.20.2, npm 10.8.2, Debian 12) with a `postgres:16-alpine`
+  service and `CI=true`: only Migrate failed before, all seven steps pass after. This is not
+  GitHub's runner (Debian slim, not Ubuntu), so the first real run is the final check. The replay
+  scripts are not committed.
+- **Not done:** the Lint step is a no-op (there is no `lint` script, so `--if-present` skips it),
+  and the Node version is left at 20.
 
 ## Classification history scope
 
