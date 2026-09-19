@@ -1,4 +1,4 @@
-import { ClassificationResult } from './keyword-classifier';
+import { ClassificationResult } from './classification-provider';
 
 // Fewer words than this counts as a "very short" message.
 const SHORT_MESSAGE_WORDS = 3;

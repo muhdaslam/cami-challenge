@@ -1,5 +1,5 @@
 import { IsOptional, IsString, IsUUID, Matches, MaxLength } from 'class-validator';
-import { ClassificationCategory } from './keyword-classifier';
+import { ClassificationCategory } from './classification-provider';
 
 export const MAX_MESSAGE_LENGTH = 2000;
 

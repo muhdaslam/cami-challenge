@@ -13,8 +13,35 @@ What did you tackle first, what did you defer, and why?
 - CI third: a one-line cause, but it interacts with the Postgres-backed test from the first task.
 - Controller structure fourth: classify only, not a rewrite. Validation, the two rules and
   persistence each got one home, so task 5's provider swap and history insert have an obvious place.
+- Classification history last, as the largest slice. It builds on that layering: the provider seam,
+  the transaction and the history insert each landed in `ClassificationService`.
 
 ## Assumptions
+
+Classification history (task 5):
+
+- **Every classify call is recorded**, including ad-hoc calls with no `requestId` (stored with
+  `request_id` NULL). Ad-hoc text has no request to cascade-delete it, so a retention and deletion
+  policy is an open question before real customer text goes through that path.
+- **The history is an append-only log.** Classifying a request twice gives two rows; the request
+  itself keeps only the latest result. The app never updates or deletes history rows.
+- **A row stores** the trimmed text that was classified (what the client sent, which is not
+  necessarily the request's stored message), the final result after the policy rules, and the
+  provider name. It does not store the provider's raw answer; for an LLM that, plus model and
+  prompt version, would be worth adding.
+- **Provider name is provenance.** For an LLM it should carry model and prompt version
+  (for example `some-model@prompt-v3`), because history is what lets you compare providers.
+- **Only applied classifications are recorded.** An unknown request (404), a failing provider (502)
+  or an invalid provider answer (502) leaves no row.
+- **History rows are deleted with their request** (`ON DELETE CASCADE`, like notes). There is no
+  delete endpoint today.
+- **Categories are a closed set** (`support`, `sales`, `billing`, `unknown`), enforced in the app
+  (DTOs and the provider guard) and not by a database `CHECK`, which would turn every taxonomy
+  change into a migration.
+- **The list endpoint is strict:** `category`, `requestId` and `limit` are validated and anything
+  else is a 400, with no silent fallback. Newest first, `limit` defaults to 50 (maximum 200), and
+  `total` counts every match.
+- **There is no auth or per-user scoping** anywhere in the API, so the history is global.
 
 ## Trade-offs
 
@@ -134,6 +161,54 @@ What did you tackle first, what did you defer, and why?
 
 What you implemented for history / provider seam, and what you left out.
 
+- **Schema:** table `classification_history` (migration `1789821338890-ClassificationHistory`) with
+  three indexes: `(created_at DESC, id DESC)` for the list, `(category, created_at DESC, id DESC)`
+  for the filtered list, `(request_id, created_at DESC, id DESC)` for one request and the cascade.
+  Checked on 60,000 synthetic rows: both list queries are plain index scans (~0.02 ms). The first
+  version of the request index lacked `id` and needed a sort; the migration was not deployed, so it
+  was edited. `total` is a count scan (~1.5 ms at 60k rows) that grows with the matches; when the
+  table gets large, replace it with an estimate or a "has more" flag.
+- **Recording:** `ClassificationService` writes the history row in the same transaction as the
+  request update (`applyClassification` takes an optional `EntityManager`, a small TypeORM leak
+  into the service signature until the persistence seam of task 6). A Postgres test proves it: a
+  history insert that fails rolls the request update back, and that test fails if the update is
+  moved outside the transaction.
+- **Provider interface:** `ClassificationProvider { name; classify(message) }` returns a result or a
+  promise of one, so an LLM fits without changing `KeywordClassifier`'s API or test. It is
+  injected by a DI token, and the one line in `RequestsModule` that binds it is the swap point.
+  The policy rules (short messages, weak results) stay in the service so they apply to any
+  provider. A provider is treated as external input: an unknown category or a confidence outside
+  [0, 1] is a 502, and so is a provider that throws (the cause is logged).
+- **LLM failure modes (design notes, not built):** *timeouts and retries* belong inside the
+  provider, bounded, with a 502 rather than a silent "unknown" when it gives up; *malformed or
+  invented output* is what the guard catches; *non-determinism* is contained by temperature 0 and
+  a versioned provider name; *latency and cost* matter because classify is synchronous in the
+  request today, so an LLM would move it to a job and let the UI poll the history; *prompt
+  injection and PII*: customer text goes into the prompt, so its output is untrusted (the guard)
+  and what may leave the system needs a decision; *rate limits* need backoff.
+- **Web:** `/history` shows the category badge, a confidence bar, the message, the provider, and a
+  short request id or "ad hoc", with a category filter, "Showing the latest N of M", and loading,
+  error and empty states. A screenshot check found the last column clipped (I had copied the
+  Requests page's `overflow-hidden` card); the card now scrolls sideways and the message column
+  takes the remaining width, and the script measures clipping instead of inferring it.
+- **Deploy ordering:** the migration only adds a table, so it is an "expand" step: safe to run
+  before the new code ships, and the old code ignores it. The api container migrates at boot, so a
+  rolling deploy has to finish the migration before new instances take traffic. Rolling back is
+  `down`, which drops the table and its data: acceptable only before real history exists.
+- **Test isolation:** the Postgres-backed test files now run one at a time. A whole-table count in
+  `requests-list.test.ts` raced with other files inserting requests (reproduced: 1 failure in 60
+  runs; 0 in 120 after the change), and a third database file made that likelier. The suite still
+  takes about 1.5 s.
+- **Verification:** an A/B of classify against the previous commit gave identical responses and
+  request-row changes over 18 scenarios, the only new effect being the history row. Eleven
+  injected bugs (no transaction, no recording, no guard, wrong order or filter, `total` from the
+  page, missing validation) were each caught by a test. The CI replay passes on npm 10.8.2 with
+  the migration run on an empty database (88 tests). The browser scripts are not committed.
+- **Left out:** seeding demo history; date-range and provider filters; cursor pagination or "load
+  more"; a per-request drill-down in the UI (the API supports `?requestId=`); an env switch for
+  the provider (one implementation, so it would be speculative); an LLM provider; the raw provider
+  output; retention and deletion.
+
 ## Stretch (if any)
 
 ## What you would do with more time
@@ -144,9 +219,10 @@ What you implemented for history / provider seam, and what you left out.
   scale.
 - Add the `(request_id, created_at DESC)` index if notes per request grow enough for the
   latest-note lookup to show up in `EXPLAIN`.
-- Add a web test runner and cover the status / classify cache behaviour. When classifications
-  are persisted (history), invalidate `['history']` on classify if navigation becomes
-  client-side; today the nav uses plain `<a>` links, so every navigation is a full reload.
+- Add a web test runner and cover the status / classify cache behaviour and the history page.
+  Now that history exists, invalidate `['history']` when a classification finishes if navigation
+  becomes client-side; today the nav uses plain `<a>` links, so every navigation is a full reload.
 - Give `create` and `updateStatus` the same DTO treatment (an invalid status is currently
-  stored as-is), then consider a global `ValidationPipe`. Put the classifier behind an interface
-  and make the classify update atomic with the history insert (task 5).
+  stored as-is), then consider a global `ValidationPipe`.
+- History: keyset pagination, date-range and provider filters, a drill-down from a request, a
+  retention policy for ad-hoc text, and an estimated `total` once the table is large.

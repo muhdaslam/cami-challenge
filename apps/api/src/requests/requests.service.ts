@@ -1,8 +1,8 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { FindOptionsRelations, Repository } from 'typeorm';
+import { EntityManager, FindOptionsRelations, Repository } from 'typeorm';
+import { ClassificationResult } from './classification-provider';
 import { CustomerRequest, RequestStatus } from './customer-request.entity';
-import { ClassificationResult } from './keyword-classifier';
 import { RequestNote } from './request-note.entity';
 
 export type RequestListItem = {
@@ -86,18 +86,21 @@ export class RequestsService {
     return this.findOrFail(id, { notes: true });
   }
 
+  // Pass the manager of a running transaction to make this part of it.
   async applyClassification(
     id: string,
     { category, confidence }: ClassificationResult,
+    manager?: EntityManager,
   ): Promise<void> {
-    const row = await this.findOrFail(id);
+    const requests = manager ? manager.getRepository(CustomerRequest) : this.requests;
+    const row = await this.findOrFail(id, undefined, requests);
     row.category = category;
     row.confidence = confidence;
     // Classifying a request means work on it has started.
     if (row.status === 'open') {
       row.status = 'in_progress';
     }
-    await this.requests.save(row);
+    await requests.save(row);
   }
 
   async updateStatus(id: string, status: RequestStatus): Promise<CustomerRequest> {
@@ -119,8 +122,9 @@ export class RequestsService {
   private async findOrFail(
     id: string,
     relations?: FindOptionsRelations<CustomerRequest>,
+    requests: Repository<CustomerRequest> = this.requests,
   ): Promise<CustomerRequest> {
-    const row = await this.requests.findOne({ where: { id }, relations });
+    const row = await requests.findOne({ where: { id }, relations });
     if (!row) {
       throw new NotFoundException(`Request ${id} not found`);
     }

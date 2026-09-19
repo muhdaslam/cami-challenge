@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyClassificationRules } from '../src/requests/classification-rules';
-import { ClassificationResult } from '../src/requests/keyword-classifier';
+import { ClassificationResult } from '../src/requests/classification-provider';
 
 const result = (category: ClassificationResult['category'], confidence: number) => ({
   category,

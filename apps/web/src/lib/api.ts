@@ -74,9 +74,38 @@ export async function classifyMessage(message: string, requestId?: string) {
   return res.json();
 }
 
-export async function fetchHistory(category?: string) {
-  const qs = category ? `?category=${encodeURIComponent(category)}` : '';
-  const res = await fetch(`${API_URL}/requests/history${qs}`);
+export const CLASSIFICATION_CATEGORIES = ['billing', 'sales', 'support', 'unknown'] as const;
+
+export type ClassificationCategory = (typeof CLASSIFICATION_CATEGORIES)[number];
+
+export type ClassificationHistoryItem = {
+  id: string;
+  // Null for a classification that was not attached to a request.
+  requestId: string | null;
+  message: string;
+  category: ClassificationCategory;
+  confidence: number;
+  provider: string;
+  createdAt: string;
+};
+
+export type ClassificationHistoryPage = {
+  items: ClassificationHistoryItem[];
+  // Every match, not only the rows returned.
+  total: number;
+};
+
+// The history table shows this many rows.
+export const HISTORY_LIMIT = 50;
+
+export async function fetchHistory(
+  category?: ClassificationCategory,
+): Promise<ClassificationHistoryPage> {
+  const params = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
+  if (category) {
+    params.set('category', category);
+  }
+  const res = await fetch(`${API_URL}/requests/history?${params}`);
   if (!res.ok) {
     throw new Error(`Failed to load history (${res.status})`);
   }

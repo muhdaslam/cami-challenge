@@ -10,16 +10,23 @@ import {
   Query,
   ValidationPipe,
 } from '@nestjs/common';
+import { ClassificationHistoryService } from './classification-history.service';
 import { ClassificationService } from './classification.service';
 import { ClassifyRequestDto, ClassifyResponse } from './classify.dto';
+import { ClassificationHistoryPage, HistoryQueryDto } from './history-query.dto';
 import { RequestsService } from './requests.service';
 import { RequestStatus } from './customer-request.entity';
+
+// `transform` is what turns query strings into the numbers a DTO declares; `stopAtFirstError`
+// keeps the error body to one reason per field.
+const dtoPipe = new ValidationPipe({ whitelist: true, transform: true, stopAtFirstError: true });
 
 @Controller('requests')
 export class RequestsController {
   constructor(
     private readonly requestsService: RequestsService,
     private readonly classification: ClassificationService,
+    private readonly classificationHistory: ClassificationHistoryService,
   ) {}
 
   @Get()
@@ -30,12 +37,10 @@ export class RequestsController {
     return this.requestsService.list(limit);
   }
 
+  // Declared before ':id' so "history" is not read as an id.
   @Get('history')
-  history(@Query('category') _category?: string) {
-    return {
-      items: [],
-      message: 'Classification history is not implemented yet.',
-    };
+  history(@Query(dtoPipe) query: HistoryQueryDto): Promise<ClassificationHistoryPage> {
+    return this.classificationHistory.list(query);
   }
 
   @Get(':id')
@@ -60,9 +65,7 @@ export class RequestsController {
   }
 
   @Post('classify')
-  classify(
-    @Body(new ValidationPipe({ whitelist: true, stopAtFirstError: true })) dto: ClassifyRequestDto,
-  ): Promise<ClassifyResponse> {
+  classify(@Body(dtoPipe) dto: ClassifyRequestDto): Promise<ClassifyResponse> {
     return this.classification.classify(dto);
   }
 }
