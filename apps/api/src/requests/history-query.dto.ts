@@ -23,19 +23,3 @@ export class HistoryQueryDto {
   @IsInt()
   limit?: number;
 }
-
-export type ClassificationHistoryItem = {
-  id: string;
-  requestId: string | null;
-  message: string;
-  category: ClassificationCategory;
-  confidence: number;
-  provider: string;
-  createdAt: string;
-};
-
-export type ClassificationHistoryPage = {
-  items: ClassificationHistoryItem[];
-  // Every match, ignoring `limit`.
-  total: number;
-};

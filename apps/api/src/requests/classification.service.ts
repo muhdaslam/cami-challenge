@@ -1,6 +1,15 @@
-import { BadGatewayException, Inject, Injectable, Logger } from '@nestjs/common';
-import { DataSource } from 'typeorm';
-import { ClassificationHistoryService } from './classification-history.service';
+import {
+  BadGatewayException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import {
+  CLASSIFICATION_LOG,
+  ClassificationLog,
+  RequestNotFoundError,
+} from './classification-log';
 import { applyClassificationRules } from './classification-rules';
 import {
   CLASSIFICATION_PROVIDER,
@@ -8,7 +17,6 @@ import {
   isClassificationResult,
 } from './classification-provider';
 import { ClassifyRequestDto, ClassifyResponse } from './classify.dto';
-import { RequestsService } from './requests.service';
 
 @Injectable()
 export class ClassificationService {
@@ -16,9 +24,7 @@ export class ClassificationService {
 
   constructor(
     @Inject(CLASSIFICATION_PROVIDER) private readonly provider: ClassificationProvider,
-    private readonly requests: RequestsService,
-    private readonly history: ClassificationHistoryService,
-    private readonly dataSource: DataSource,
+    @Inject(CLASSIFICATION_LOG) private readonly log: ClassificationLog,
   ) {}
 
   async classify({ message, requestId }: ClassifyRequestDto): Promise<ClassifyResponse> {
@@ -26,22 +32,19 @@ export class ClassificationService {
     const suggestion = await this.askProvider(trimmed);
     const result = applyClassificationRules(suggestion, trimmed);
 
-    // The request update and its history row stand or fall together.
-    await this.dataSource.transaction(async (manager) => {
-      if (requestId) {
-        await this.requests.applyClassification(requestId, result, manager);
+    try {
+      await this.log.record({
+        requestId: requestId ?? null,
+        message: trimmed,
+        result,
+        provider: this.provider.name,
+      });
+    } catch (error) {
+      if (error instanceof RequestNotFoundError) {
+        throw new NotFoundException(error.message);
       }
-      await this.history.record(
-        {
-          requestId: requestId ?? null,
-          message: trimmed,
-          category: result.category,
-          confidence: result.confidence,
-          provider: this.provider.name,
-        },
-        manager,
-      );
-    });
+      throw error;
+    }
 
     return {
       category: result.category,

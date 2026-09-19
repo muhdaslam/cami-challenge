@@ -15,6 +15,9 @@ What did you tackle first, what did you defer, and why?
   persistence each got one home, so task 5's provider swap and history insert have an obvious place.
 - Classification history last, as the largest slice. It builds on that layering: the provider seam,
   the transaction and the history insert each landed in `ClassificationService`.
+- Persistence boundary (stretch) after that: by then the leak was concrete and measurable (a
+  `DataSource` in the service and an `EntityManager` in two other services' signatures), so the seam
+  could be shaped by what actually hurt.
 
 ## Assumptions
 
@@ -55,8 +58,9 @@ Classification history (task 5):
   pagination stays cheap to add. `id` is a tie-breaker so the order is deterministic.
 - **Result:** median 224.7 ms -> 4.4 ms (same process, same DB, warm cache), 1,202 queries -> 1.
   The HTTP response was byte-identical to the old implementation on the live data.
-- **Tests:** `apps/api/test/requests-list.test.ts` needs Postgres (`DATABASE_URL`) and is skipped
-  otherwise. Each assertion was mutation-checked: it fails when the matching bug is reintroduced
+- **Tests:** the list tests (now in `apps/api/test/typeorm-request-store.test.ts`, originally
+  `requests-list.test.ts`) need Postgres (`DATABASE_URL`) and are skipped otherwise. Each
+  assertion was mutation-checked: it fails when the matching bug is reintroduced
   (extra query per row, oldest note as "latest", wrong order, note-less requests dropped).
 - **Not done:** pagination (changes the response contract, and the UI only renders the first 25
   rows) and a `(request_id, created_at DESC)` index (the existing index is enough at this size:
@@ -168,11 +172,11 @@ What you implemented for history / provider seam, and what you left out.
   version of the request index lacked `id` and needed a sort; the migration was not deployed, so it
   was edited. `total` is a count scan (~1.5 ms at 60k rows) that grows with the matches; when the
   table gets large, replace it with an estimate or a "has more" flag.
-- **Recording:** `ClassificationService` writes the history row in the same transaction as the
-  request update (`applyClassification` takes an optional `EntityManager`, a small TypeORM leak
-  into the service signature until the persistence seam of task 6). A Postgres test proves it: a
-  history insert that fails rolls the request update back, and that test fails if the update is
-  moved outside the transaction.
+- **Recording:** the history row is written in the same transaction as the request update. This
+  first lived in `ClassificationService` with an `EntityManager` passed through two other services;
+  it now sits behind the `ClassificationLog` port (see "Persistence boundary"). A Postgres test
+  proves it: a history insert that fails rolls the request update back, and that test fails if
+  the update is moved outside the transaction.
 - **Provider interface:** `ClassificationProvider { name; classify(message) }` returns a result or a
   promise of one, so an LLM fits without changing `KeywordClassifier`'s API or test. It is
   injected by a DI token, and the one line in `RequestsModule` that binds it is the swap point.
@@ -196,9 +200,9 @@ What you implemented for history / provider seam, and what you left out.
   rolling deploy has to finish the migration before new instances take traffic. Rolling back is
   `down`, which drops the table and its data: acceptable only before real history exists.
 - **Test isolation:** the Postgres-backed test files now run one at a time. A whole-table count in
-  `requests-list.test.ts` raced with other files inserting requests (reproduced: 1 failure in 60
-  runs; 0 in 120 after the change), and a third database file made that likelier. The suite still
-  takes about 1.5 s.
+  `requests-list.test.ts` (now `typeorm-request-store.test.ts`) raced with other files inserting
+  requests (reproduced: 1 failure in 60 runs; 0 in 120 after the change), and a third database
+  file made that likelier. The suite still takes about 1.5 s.
 - **Verification:** an A/B of classify against the previous commit gave identical responses and
   request-row changes over 18 scenarios, the only new effect being the history row. Eleven
   injected bugs (no transaction, no recording, no guard, wrong order or filter, `total` from the
@@ -210,6 +214,46 @@ What you implemented for history / provider seam, and what you left out.
   output; retention and deletion.
 
 ## Stretch (if any)
+
+### Persistence boundary
+
+- **Where it hurt (measured before the change):** three services imported TypeORM, `EntityManager`
+  was in two services' public signatures, `ClassificationService` held a `DataSource`, its unit test
+  needed four fakes plus a fake transaction, `RequestsService` had no DB-free tests at all, and the
+  `open` -> `in_progress` rule lived inside a TypeORM method, so proving it needed Postgres.
+- **The seam:** two ports shaped by use case and free of any framework: `RequestStore` (list, find
+  with notes, create, update status) and `ClassificationLog` (record, list). Two, not one per table
+  and not a generic `Repository<T>` (that would only re-create TypeORM's API): `record` touches the
+  request and the history together and they must change together, so one port owns that
+  transaction. "Not found" is `null` from a query and a `RequestNotFoundError` from the command,
+  which cannot return an absence; the services map both to the same 404 bodies as before.
+- **Adapters:** `TypeOrmRequestStore` and `TypeOrmClassificationLog` hold all the TypeORM code (the
+  list's SQL moved over unchanged). They return the entities typed as the ports' plain records
+  without re-mapping, so the JSON is identical; a test pins its key order.
+- **Domain rule:** `classifiedRequest` is pure, so any store shares one implementation of "starts
+  work on an open request" and it is tested without a database.
+- **Scope, and what it buys:** ports for every data access, as chosen. I had recommended only the
+  classify write path, which alone removes the real leak. The read-side ports are pass-throughs with
+  one implementation; what they add is DB-free tests for `RequestsService` and
+  `ClassificationHistoryService`, tests for get, create and update status that did not exist
+  (they now run against the adapter), and a rule a test can enforce. The cost is six files and two
+  DI tokens.
+- **Guard:** `architecture.test.ts` fails if anything outside the adapters, the entities and the
+  module imports TypeORM or an entity, or if a port, model or rule imports a framework.
+- **Before -> after:** service files importing TypeORM 3 -> 0; `EntityManager` in service
+  signatures 2 -> 0; `ClassificationService` collaborators 4 -> 2; persistence casts in its test
+  4 -> 0; services with DB-free tests 1 -> 3; tests that run without Postgres 71 -> 105.
+- **Verification:** an A/B of every endpoint against the previous commit (43 scenarios: byte-exact
+  for reads, ids and timestamps normalised for writes, including the existing quirks such as a 500
+  for a non-UUID id and any string accepted as a status) was identical, as were the request rows
+  and history rows the writes left behind. Eleven injected bugs were each caught, among them a
+  request update outside the transaction (the Postgres rollback test) and a service importing
+  TypeORM (the guard). The CI replay passes with 129 tests. The scripts are not committed.
+- **Not done:** an in-memory adapter (it pays rent only with a second consumer); a separate domain
+  model (the entities stay shared with `data-source.ts`, the module and the adapters, so the port
+  types are satisfied structurally, and a real second store would want its own mapping); a response
+  DTO layer (the controller returns the records, whose shape is the API); changing any behaviour,
+  including the quirks above.
 
 ## What you would do with more time
 

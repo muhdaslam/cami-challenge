@@ -1,28 +1,19 @@
 import 'reflect-metadata';
 import { BadGatewayException, Logger, NotFoundException } from '@nestjs/common';
-import { DataSource, EntityManager } from 'typeorm';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ClassificationHistoryService } from '../src/requests/classification-history.service';
+import { ClassificationLog, RequestNotFoundError } from '../src/requests/classification-log';
 import { ClassificationProvider } from '../src/requests/classification-provider';
 import { ClassificationService } from '../src/requests/classification.service';
 import { KeywordClassifier } from '../src/requests/keyword-classifier';
-import { RequestsService } from '../src/requests/requests.service';
 
 const ID = '3f2b1c9e-8d4a-4e6b-9a1f-2c5d7e8f9a0b';
 
 describe('ClassificationService', () => {
-  const manager = { tag: 'transaction manager' } as unknown as EntityManager;
-  const transaction = vi.fn(async (work: (m: EntityManager) => Promise<unknown>) => work(manager));
-  const applyClassification = vi.fn();
   const record = vi.fn();
+  const log = { record, list: vi.fn() } satisfies ClassificationLog;
 
   const build = (provider: ClassificationProvider = new KeywordClassifier()) =>
-    new ClassificationService(
-      provider,
-      { applyClassification } as unknown as RequestsService,
-      { record } as unknown as ClassificationHistoryService,
-      { transaction } as unknown as DataSource,
-    );
+    new ClassificationService(provider, log);
   const service = build();
 
   // The provider failures below are logged on purpose; keep the test output readable.
@@ -30,28 +21,21 @@ describe('ClassificationService', () => {
     Logger.overrideLogger(false);
   });
 
-  // Block bodies: a returned function would be run by Vitest as a teardown hook.
+  // A block body: a returned function would be run by Vitest as a teardown hook.
   beforeEach(() => {
-    applyClassification.mockReset();
     record.mockReset();
-    transaction.mockClear();
   });
 
-  it('records an ad-hoc classification without touching any request', async () => {
+  it('records an ad-hoc classification without a request', async () => {
     const response = await service.classify({ message: 'Please fix my invoice and payment charge' });
 
     expect(response).toEqual({ category: 'billing', confidence: 0.86, requestId: null });
-    expect(applyClassification).not.toHaveBeenCalled();
-    expect(record).toHaveBeenCalledWith(
-      {
-        requestId: null,
-        message: 'Please fix my invoice and payment charge',
-        category: 'billing',
-        confidence: 0.86,
-        provider: 'keyword',
-      },
-      manager,
-    );
+    expect(record).toHaveBeenCalledWith({
+      requestId: null,
+      message: 'Please fix my invoice and payment charge',
+      result: { category: 'billing', confidence: 0.86 },
+      provider: 'keyword',
+    });
   });
 
   it('treats a null requestId like a missing one', async () => {
@@ -60,7 +44,6 @@ describe('ClassificationService', () => {
     };
 
     expect((await service.classify(dto)).requestId).toBeNull();
-    expect(applyClassification).not.toHaveBeenCalled();
     expect(record.mock.calls[0][0].requestId).toBeNull();
   });
 
@@ -72,52 +55,59 @@ describe('ClassificationService', () => {
     expect(record.mock.calls[0][0].message).toBe('refund');
   });
 
-  it('applies the result to the request and records it in the same transaction', async () => {
+  it('records the result after the rules for the given request, and echoes the requestId', async () => {
     const response = await service.classify({ message: 'refund', requestId: ID });
 
     expect(response).toEqual({ category: 'billing', confidence: response.confidence, requestId: ID });
-    expect(transaction).toHaveBeenCalledTimes(1);
-    expect(applyClassification).toHaveBeenCalledWith(
-      ID,
-      { category: 'billing', confidence: response.confidence },
-      manager,
-    );
     expect(record).toHaveBeenCalledTimes(1);
-    expect(record.mock.calls[0][0]).toMatchObject({ requestId: ID, message: 'refund' });
-    expect(record.mock.calls[0][1]).toBe(manager);
+    expect(record).toHaveBeenCalledWith({
+      requestId: ID,
+      message: 'refund',
+      result: { category: 'billing', confidence: response.confidence },
+      provider: 'keyword',
+    });
+    expect(response.confidence).toBeCloseTo(0.71, 10);
   });
 
   it('records the name of whichever provider answered', async () => {
-    const other = { name: 'test-llm', classify: () => ({ category: 'sales', confidence: 0.9 }) };
+    const other: ClassificationProvider = {
+      name: 'test-llm',
+      classify: () => ({ category: 'sales', confidence: 0.9 }),
+    };
 
-    await build(other as ClassificationProvider).classify({ message: 'a long enough message' });
+    await build(other).classify({ message: 'a long enough message' });
 
-    expect(record.mock.calls[0][0]).toMatchObject({ provider: 'test-llm', category: 'sales' });
+    expect(record.mock.calls[0][0]).toMatchObject({
+      provider: 'test-llm',
+      result: { category: 'sales' },
+    });
   });
 
   it('accepts a provider that answers asynchronously', async () => {
     const slow = {
       name: 'slow',
       classify: async () => ({ category: 'support', confidence: 0.9 }),
-    };
+    } satisfies ClassificationProvider;
 
-    const response = await build(slow as ClassificationProvider).classify({
-      message: 'a long enough message',
-    });
+    const response = await build(slow).classify({ message: 'a long enough message' });
 
     expect(response.category).toBe('support');
   });
 
   it('reports "unknown" when the provider is not confident enough', async () => {
     // KeywordClassifier can never trigger this rule; another provider could.
-    const unsure = { name: 'unsure', classify: () => ({ category: 'billing', confidence: 0.5 }) };
+    const unsure: ClassificationProvider = {
+      name: 'unsure',
+      classify: () => ({ category: 'billing', confidence: 0.5 }),
+    };
 
-    const response = await build(unsure as ClassificationProvider).classify({
-      message: 'a long enough message',
-    });
+    const response = await build(unsure).classify({ message: 'a long enough message' });
 
     expect(response).toEqual({ category: 'unknown', confidence: 0.5, requestId: null });
-    expect(record.mock.calls[0][0]).toMatchObject({ category: 'unknown', provider: 'unsure' });
+    expect(record.mock.calls[0][0]).toMatchObject({
+      provider: 'unsure',
+      result: { category: 'unknown', confidence: 0.5 },
+    });
   });
 
   it.each([
@@ -128,7 +118,7 @@ describe('ClassificationService', () => {
     ['a confidence that is text', { category: 'billing', confidence: '0.8' }],
     ['no result at all', null],
     ['an empty result', {}],
-  ])('rejects a provider that returns %s, and persists nothing', async (_name, answer) => {
+  ])('rejects a provider that returns %s, and records nothing', async (_name, answer) => {
     const broken = { name: 'broken', classify: () => answer };
 
     await expect(
@@ -137,20 +127,22 @@ describe('ClassificationService', () => {
         requestId: ID,
       }),
     ).rejects.toBeInstanceOf(BadGatewayException);
-    expect(transaction).not.toHaveBeenCalled();
     expect(record).not.toHaveBeenCalled();
   });
 
   it('accepts the confidence bounds 0 and 1', async () => {
     for (const confidence of [0, 1]) {
-      const edge = { name: 'edge', classify: () => ({ category: 'billing', confidence }) };
-      await build(edge as ClassificationProvider).classify({ message: 'a long enough message' });
+      const edge: ClassificationProvider = {
+        name: 'edge',
+        classify: () => ({ category: 'billing', confidence }),
+      };
+      await build(edge).classify({ message: 'a long enough message' });
     }
 
     expect(record).toHaveBeenCalledTimes(2);
   });
 
-  it('turns a provider failure into a bad gateway, and persists nothing', async () => {
+  it('turns a provider failure into a bad gateway, and records nothing', async () => {
     const down = {
       name: 'down',
       classify: () => {
@@ -158,18 +150,25 @@ describe('ClassificationService', () => {
       },
     };
 
-    await expect(
-      build(down as unknown as ClassificationProvider).classify({ message: 'refund' }),
-    ).rejects.toBeInstanceOf(BadGatewayException);
-    expect(transaction).not.toHaveBeenCalled();
-  });
-
-  it('lets a missing request surface as NotFoundException, and records nothing', async () => {
-    applyClassification.mockRejectedValue(new NotFoundException());
-
-    await expect(service.classify({ message: 'refund', requestId: ID })).rejects.toBeInstanceOf(
-      NotFoundException,
+    await expect(build(down).classify({ message: 'refund' })).rejects.toBeInstanceOf(
+      BadGatewayException,
     );
     expect(record).not.toHaveBeenCalled();
+  });
+
+  it('turns an unknown request into a 404 with the same message', async () => {
+    record.mockRejectedValue(new RequestNotFoundError(ID));
+
+    const failure = await service.classify({ message: 'refund', requestId: ID }).catch((e) => e);
+
+    expect(failure).toBeInstanceOf(NotFoundException);
+    expect(failure.message).toBe(`Request ${ID} not found`);
+  });
+
+  it('lets any other storage failure through unchanged', async () => {
+    const outage = new Error('connection terminated');
+    record.mockRejectedValue(outage);
+
+    await expect(service.classify({ message: 'refund', requestId: ID })).rejects.toBe(outage);
   });
 });

@@ -11,11 +11,12 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import { ClassificationHistoryService } from './classification-history.service';
+import { ClassificationHistoryPage } from './classification-log';
 import { ClassificationService } from './classification.service';
 import { ClassifyRequestDto, ClassifyResponse } from './classify.dto';
-import { ClassificationHistoryPage, HistoryQueryDto } from './history-query.dto';
+import { HistoryQueryDto } from './history-query.dto';
+import { RequestStatus } from './request-model';
 import { RequestsService } from './requests.service';
-import { RequestStatus } from './customer-request.entity';
 
 // `transform` is what turns query strings into the numbers a DTO declares; `stopAtFirstError`
 // keeps the error body to one reason per field.
