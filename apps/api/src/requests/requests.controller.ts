@@ -1,8 +1,10 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
   Param,
+  ParseIntPipe,
   Patch,
   Post,
   Query,
@@ -19,8 +21,11 @@ export class RequestsController {
   ) {}
 
   @Get()
-  list() {
-    return this.requestsService.list();
+  list(@Query('limit', new ParseIntPipe({ optional: true })) limit?: number) {
+    if (limit !== undefined && limit < 1) {
+      throw new BadRequestException('limit must be a positive integer');
+    }
+    return this.requestsService.list(limit);
   }
 
   @Get('history')

@@ -110,6 +110,26 @@ describe.skipIf(!process.env.DATABASE_URL)('RequestsService.list', () => {
     expect(items[0].createdAt).toBe(at(60_000).toISOString());
   });
 
+  it('returns every request when no limit is given', async () => {
+    const [{ total }] = await ds.query<{ total: number }[]>(
+      'SELECT count(*)::int AS total FROM customer_requests',
+    );
+
+    expect(await service.list()).toHaveLength(total);
+  });
+
+  it('bounds the query itself to the newest rows, unchanged', async () => {
+    const all = await service.list();
+
+    counter.queries.length = 0;
+    const limited = await service.list(2);
+
+    expect(limited).toEqual(all.slice(0, 2));
+    // One statement with a LIMIT, not the full list sliced in JS.
+    expect(counter.queries).toHaveLength(1);
+    expect(counter.queries[0]).toMatch(/LIMIT 2\b/);
+  });
+
   it('issues a single query however many requests and notes exist', async () => {
     counter.queries.length = 0;
     await service.list();

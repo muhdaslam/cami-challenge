@@ -30,10 +30,11 @@ export class RequestsService {
     private readonly requests: Repository<CustomerRequest>,
   ) {}
 
-  async list(): Promise<RequestListItem[]> {
+  async list(limit?: number): Promise<RequestListItem[]> {
     // Single statement: the note count and latest note are correlated sub-selects, so the
     // query count stays constant as requests and notes grow, and requests without notes
-    // are still listed. `id` breaks created_at ties so the order is deterministic.
+    // are still listed. `id` breaks created_at ties so the order is deterministic. With a
+    // `limit` the sub-selects only run for the rows that are returned.
     const rows = await this.requests
       .createQueryBuilder('request')
       .select('request.id', 'id')
@@ -64,6 +65,7 @@ export class RequestsService {
       .addSelect('request.updatedAt', 'updatedAt')
       .orderBy('request.createdAt', 'DESC')
       .addOrderBy('request.id', 'DESC')
+      .limit(limit)
       .getRawMany<RequestListRow>();
 
     return rows.map((row) => ({

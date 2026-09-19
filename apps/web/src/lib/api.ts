@@ -14,8 +14,13 @@ export type RequestListItem = {
   updatedAt: string;
 };
 
+// The table shows this many rows, so that is all we ask the API for.
+export const REQUEST_LIST_LIMIT = 25;
+
+// Takes no arguments on purpose: TanStack Query passes a context object as the first
+// argument of a queryFn, which would end up in the URL.
 export async function fetchRequests(): Promise<RequestListItem[]> {
-  const res = await fetch(`${API_URL}/requests`);
+  const res = await fetch(`${API_URL}/requests?limit=${REQUEST_LIST_LIMIT}`);
   if (!res.ok) {
     throw new Error(`Failed to load requests (${res.status})`);
   }
