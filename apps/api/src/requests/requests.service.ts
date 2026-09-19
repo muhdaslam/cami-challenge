@@ -16,42 +16,67 @@ export type RequestListItem = {
   updatedAt: string;
 };
 
+// Raw driver row: `pg` returns bigint (COUNT) as a string and timestamptz as a Date.
+type RequestListRow = Omit<RequestListItem, 'noteCount' | 'createdAt' | 'updatedAt'> & {
+  noteCount: string;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
 @Injectable()
 export class RequestsService {
   constructor(
     @InjectRepository(CustomerRequest)
     private readonly requests: Repository<CustomerRequest>,
-    @InjectRepository(RequestNote)
-    private readonly notes: Repository<RequestNote>,
   ) {}
 
   async list(): Promise<RequestListItem[]> {
-    const rows = await this.requests.find({
-      order: { createdAt: 'DESC' },
-    });
+    // Single statement: the note count and latest note are correlated sub-selects, so the
+    // query count stays constant as requests and notes grow, and requests without notes
+    // are still listed. `id` breaks created_at ties so the order is deterministic.
+    const rows = await this.requests
+      .createQueryBuilder('request')
+      .select('request.id', 'id')
+      .addSelect('request.message', 'message')
+      .addSelect('request.status', 'status')
+      .addSelect('request.category', 'category')
+      .addSelect('request.confidence', 'confidence')
+      .addSelect(
+        (qb) =>
+          qb
+            .select('COUNT(*)')
+            .from(RequestNote, 'note')
+            .where('note.requestId = request.id'),
+        'noteCount',
+      )
+      .addSelect(
+        (qb) =>
+          qb
+            .select('note.body')
+            .from(RequestNote, 'note')
+            .where('note.requestId = request.id')
+            .orderBy('note.createdAt', 'DESC')
+            .addOrderBy('note.id', 'DESC')
+            .limit(1),
+        'latestNotePreview',
+      )
+      .addSelect('request.createdAt', 'createdAt')
+      .addSelect('request.updatedAt', 'updatedAt')
+      .orderBy('request.createdAt', 'DESC')
+      .addOrderBy('request.id', 'DESC')
+      .getRawMany<RequestListRow>();
 
-    const items: RequestListItem[] = [];
-    for (const row of rows) {
-      const notes = await this.notes.find({
-        where: { requestId: row.id },
-        order: { createdAt: 'DESC' },
-      });
-      row.notes = notes;
-
-      items.push({
-        id: row.id,
-        message: row.message,
-        status: row.status,
-        category: row.category,
-        confidence: row.confidence,
-        noteCount: notes.length,
-        latestNotePreview: notes[0]?.body ?? null,
-        createdAt: row.createdAt.toISOString(),
-        updatedAt: row.updatedAt.toISOString(),
-      });
-    }
-
-    return items;
+    return rows.map((row) => ({
+      id: row.id,
+      message: row.message,
+      status: row.status,
+      category: row.category,
+      confidence: row.confidence,
+      noteCount: Number(row.noteCount),
+      latestNotePreview: row.latestNotePreview,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+    }));
   }
 
   async getById(id: string): Promise<CustomerRequest> {
