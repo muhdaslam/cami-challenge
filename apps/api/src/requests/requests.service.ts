@@ -1,7 +1,8 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { FindOptionsRelations, Repository } from 'typeorm';
 import { CustomerRequest, RequestStatus } from './customer-request.entity';
+import { ClassificationResult } from './keyword-classifier';
 import { RequestNote } from './request-note.entity';
 
 export type RequestListItem = {
@@ -82,14 +83,21 @@ export class RequestsService {
   }
 
   async getById(id: string): Promise<CustomerRequest> {
-    const row = await this.requests.findOne({
-      where: { id },
-      relations: { notes: true },
-    });
-    if (!row) {
-      throw new NotFoundException(`Request ${id} not found`);
+    return this.findOrFail(id, { notes: true });
+  }
+
+  async applyClassification(
+    id: string,
+    { category, confidence }: ClassificationResult,
+  ): Promise<void> {
+    const row = await this.findOrFail(id);
+    row.category = category;
+    row.confidence = confidence;
+    // Classifying a request means work on it has started.
+    if (row.status === 'open') {
+      row.status = 'in_progress';
     }
-    return row;
+    await this.requests.save(row);
   }
 
   async updateStatus(id: string, status: RequestStatus): Promise<CustomerRequest> {
@@ -108,7 +116,14 @@ export class RequestsService {
     return this.requests.save(row);
   }
 
-  async save(request: CustomerRequest): Promise<CustomerRequest> {
-    return this.requests.save(request);
+  private async findOrFail(
+    id: string,
+    relations?: FindOptionsRelations<CustomerRequest>,
+  ): Promise<CustomerRequest> {
+    const row = await this.requests.findOne({ where: { id }, relations });
+    if (!row) {
+      throw new NotFoundException(`Request ${id} not found`);
+    }
+    return row;
   }
 }

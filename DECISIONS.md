@@ -11,6 +11,8 @@ What did you tackle first, what did you defer, and why?
 - UI freshness second: client-only and small, and the list is now fast enough (~4 ms) that
   refetching it after every mutation is cheap.
 - CI third: a one-line cause, but it interacts with the Postgres-backed test from the first task.
+- Controller structure fourth: classify only, not a rewrite. Validation, the two rules and
+  persistence each got one home, so task 5's provider swap and history insert have an obvious place.
 
 ## Assumptions
 
@@ -94,6 +96,40 @@ What did you tackle first, what did you defer, and why?
 - **Not done:** the Lint step is a no-op (there is no `lint` script, so `--if-present` skips it),
   and the Node version is left at 20.
 
+### Controller structure
+
+- **Cause:** `RequestsController.classify` did validation, two business rules and persistence
+  inline, with `body: any` and `existing: any`, and answered invalid input with `201 { error }`.
+- **Layers:** the controller is one delegating line (typed DTO in, typed response out).
+  `ClassifyRequestDto` (class-validator, route-scoped `ValidationPipe`) validates at the edge.
+  `ClassificationService` runs trim -> provider -> rules -> persist. `classification-rules.ts` is the
+  pure policy with named constants; it is applied to whatever a provider returns, so it does not
+  live in the classifier. `RequestsService.applyClassification` owns `open` -> `in_progress` (a
+  request lifecycle rule) and no longer loads every note; `save()` had no other caller and is gone.
+- **Dormant rule:** "below 0.55 is `unknown`" can never fire with `KeywordClassifier` (softened
+  values are 0.71 / 0.65 / 0.63 and `unknown` is already 0.4). It is tested with a stub provider so
+  it still holds when task 5 swaps providers.
+- **Deliberate behaviour changes:** invalid message `201 { error }` -> `400`; a non-UUID
+  `requestId` `500` -> `400`; `requestId: ""` (echoed back before) -> `400`. Error bodies are Nest's
+  standard shape with one reason per field (`stopAtFirstError`, decorator order). Nothing else changes.
+- **Verification:** HEAD's controller and the new layers were run side by side over 16,275
+  generated cases (word counts, keyword families, whitespace, the 1999 / 2000 / 2001 length
+  boundary, non-strings, every `requestId` shape) and differ only in the changes above. An HTTP
+  A/B of a HEAD build against the new build on the same database gave byte-identical responses
+  for 11 scenarios and identical row changes. Ten injected bugs were each caught by a test (the
+  0.5 floor and the 0.55 boundary only by the unit tests, since the keyword classifier cannot reach
+  them). The CI replay passes on npm 10.8.2 with the new dependencies (49 tests). The differential
+  and HTTP scripts are not committed.
+- **Dependencies:** `class-validator` and `class-transformer`. The lockfile change is additions
+  only (40 lines), generated with the npm that wrote the existing lock: npm 10 rewrote unrelated
+  entries (added `peer` flags, dropped `libc` fields), although CI's npm 10.8.2 installs the result fine.
+- **Not done:** `create` still answers `201 { error }` and `updateStatus` persists any string as a
+  status. The classify read-modify-write can lose an update to a concurrent status change (task 5's
+  history insert wants a transaction anyway). The pipe is route-scoped, not global. The provider is
+  not behind an interface yet (task 5); `ClassificationService` is the only class that knows it.
+  The pipe wiring is covered only by the HTTP check, because Vitest does not emit the decorator
+  metadata `ValidationPipe` uses.
+
 ## Classification history scope
 
 What you implemented for history / provider seam, and what you left out.
@@ -111,3 +147,6 @@ What you implemented for history / provider seam, and what you left out.
 - Add a web test runner and cover the status / classify cache behaviour. When classifications
   are persisted (history), invalidate `['history']` on classify if navigation becomes
   client-side; today the nav uses plain `<a>` links, so every navigation is a full reload.
+- Give `create` and `updateStatus` the same DTO treatment (an invalid status is currently
+  stored as-is), then consider a global `ValidationPipe`. Put the classifier behind an interface
+  and make the classify update atomic with the history insert (task 5).
