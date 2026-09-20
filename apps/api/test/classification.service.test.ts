@@ -10,7 +10,7 @@ const ID = '3f2b1c9e-8d4a-4e6b-9a1f-2c5d7e8f9a0b';
 
 describe('ClassificationService', () => {
   const record = vi.fn();
-  const log = { record, list: vi.fn() } satisfies ClassificationLog;
+  const log = { record, list: vi.fn(), facets: vi.fn() } satisfies ClassificationLog;
 
   const build = (provider: ClassificationProvider = new KeywordClassifier()) =>
     new ClassificationService(provider, log);

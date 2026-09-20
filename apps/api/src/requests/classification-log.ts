@@ -11,10 +11,28 @@ export type ClassificationEntry = {
   provider: string;
 };
 
+/** Every filter is optional, and they combine with AND. */
 export type ClassificationHistoryFilter = {
   category?: ClassificationCategory;
+  /** The exact provider name. */
+  provider?: string;
   requestId?: string;
+  /** True: only classifications that belong to no request. False: only those that do. */
+  adHoc?: boolean;
+  /** Created at or after this moment. */
+  from?: Date;
+  /** Created before this moment. */
+  to?: Date;
+  minConfidence?: number;
+  maxConfidence?: number;
+  /** A case-insensitive substring of the classified text. */
+  text?: string;
+};
+
+export type ClassificationHistoryQuery = ClassificationHistoryFilter & {
   limit: number;
+  /** The `nextCursor` of the previous page: continue after that row. */
+  cursor?: string;
 };
 
 export type ClassificationHistoryItem = {
@@ -29,9 +47,27 @@ export type ClassificationHistoryItem = {
 
 export type ClassificationHistoryPage = {
   items: ClassificationHistoryItem[];
-  // Every match, ignoring `limit`.
+  // Every match, ignoring `limit` and `cursor`.
   total: number;
+  /** Pass it as `cursor` to get the next page; null on the last page. */
+  nextCursor: string | null;
 };
+
+export type FacetCount<T extends string = string> = { value: T; count: number };
+
+/** How many classifications match per value, under every filter except that facet's own. */
+export type ClassificationHistoryFacets = {
+  category: FacetCount<ClassificationCategory>[];
+  provider: FacetCount[];
+};
+
+/** The cursor does not point at a history row (for instance, its request was deleted). */
+export class InvalidCursorError extends Error {
+  constructor() {
+    super('cursor does not point at a classification');
+    this.name = 'InvalidCursorError';
+  }
+}
 
 /** A classification was meant for a request that does not exist. */
 export class RequestNotFoundError extends Error {
@@ -54,8 +90,13 @@ export interface ClassificationLog {
    */
   record(entry: ClassificationEntry): Promise<void>;
 
-  /** Newest first. */
-  list(filter: ClassificationHistoryFilter): Promise<ClassificationHistoryPage>;
+  /**
+   * Newest first. Pages follow each other by cursor, which stays correct while new rows arrive.
+   * @throws InvalidCursorError when `cursor` does not point at a row.
+   */
+  list(query: ClassificationHistoryQuery): Promise<ClassificationHistoryPage>;
+
+  facets(filter: ClassificationHistoryFilter): Promise<ClassificationHistoryFacets>;
 }
 
 export const CLASSIFICATION_LOG = Symbol('CLASSIFICATION_LOG');

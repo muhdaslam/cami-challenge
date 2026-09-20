@@ -18,6 +18,9 @@ What did you tackle first, what did you defer, and why?
 - Persistence boundary (stretch) after that: by then the leak was concrete and measurable (a
   `DataSource` in the service and an `EntityManager` in two other services' signatures), so the seam
   could be shaped by what actually hurt.
+- Richer history filters (stretch) last: it needs the history table (task 5) and the log port
+  (persistence boundary) to exist, and the API had to come first, since the UI can only offer what
+  the API can answer.
 
 ## Assumptions
 
@@ -41,9 +44,10 @@ Classification history (task 5):
 - **Categories are a closed set** (`support`, `sales`, `billing`, `unknown`), enforced in the app
   (DTOs and the provider guard) and not by a database `CHECK`, which would turn every taxonomy
   change into a migration.
-- **The list endpoint is strict:** `category`, `requestId` and `limit` are validated and anything
-  else is a 400, with no silent fallback. Newest first, `limit` defaults to 50 (maximum 200), and
-  `total` counts every match.
+- **The list endpoint is strict:** every filter, `limit` and `cursor` is validated and an invalid
+  value is a 400, with no silent fallback (unknown parameters are ignored, not rejected). Newest
+  first, `limit` defaults to 50 (maximum 200), and `total` counts every match. The filters added
+  later are in "Richer history filters".
 - **There is no auth or per-user scoping** anywhere in the API, so the history is global.
 
 ## Trade-offs
@@ -103,8 +107,9 @@ Classification history (task 5):
 - **Known limit:** the select still shows the old value for one animation frame right after a
   change, because TanStack notifies React through a `setTimeout(0)` hop. Removing it would need
   local pending state or React's `useOptimistic`; not worth the extra code here.
-- **Not done:** an automated test. `apps/web` has no test runner, and adding vitest plus a DOM
-  environment is a separate decision. `staleTime` / `refetchOnWindowFocus` are left as they are:
+- **Not done:** an automated test. `apps/web` had no test runner, and adding vitest plus a DOM
+  environment is a separate decision (a Node-only vitest arrived later, for the history filters,
+  not for this cache behaviour). `staleTime` / `refetchOnWindowFocus` are left as they are:
   fine for reads once mutations invalidate.
 
 ### CI
@@ -168,6 +173,7 @@ What you implemented for history / provider seam, and what you left out.
 - **Schema:** table `classification_history` (migration `1789821338890-ClassificationHistory`) with
   three indexes: `(created_at DESC, id DESC)` for the list, `(category, created_at DESC, id DESC)`
   for the filtered list, `(request_id, created_at DESC, id DESC)` for one request and the cascade.
+  (A fourth, for the provider filter, came with "Richer history filters".)
   Checked on 60,000 synthetic rows: both list queries are plain index scans (~0.02 ms). The first
   version of the request index lacked `id` and needed a sort; the migration was not deployed, so it
   was edited. `total` is a count scan (~1.5 ms at 60k rows) that grows with the matches; when the
@@ -194,7 +200,8 @@ What you implemented for history / provider seam, and what you left out.
   short request id or "ad hoc", with a category filter, "Showing the latest N of M", and loading,
   error and empty states. A screenshot check found the last column clipped (I had copied the
   Requests page's `overflow-hidden` card); the card now scrolls sideways and the message column
-  takes the remaining width, and the script measures clipping instead of inferring it.
+  takes the remaining width, and the script measures clipping instead of inferring it. The page
+  was rebuilt later; see "Richer history filters".
 - **Deploy ordering:** the migration only adds a table, so it is an "expand" step: safe to run
   before the new code ships, and the old code ignores it. The api container migrates at boot, so a
   rolling deploy has to finish the migration before new instances take traffic. Rolling back is
@@ -208,10 +215,10 @@ What you implemented for history / provider seam, and what you left out.
   injected bugs (no transaction, no recording, no guard, wrong order or filter, `total` from the
   page, missing validation) were each caught by a test. The CI replay passes on npm 10.8.2 with
   the migration run on an empty database (88 tests). The browser scripts are not committed.
-- **Left out:** seeding demo history; date-range and provider filters; cursor pagination or "load
-  more"; a per-request drill-down in the UI (the API supports `?requestId=`); an env switch for
-  the provider (one implementation, so it would be speculative); an LLM provider; the raw provider
-  output; retention and deletion.
+- **Left out:** seeding demo history; an env switch for the provider (one implementation, so it
+  would be speculative); an LLM provider; the raw provider output; retention and deletion.
+  Date-range and provider filters, cursor pagination ("load more") and the per-request drill-down
+  were also left out here and were added afterwards ("Richer history filters").
 
 ## Stretch (if any)
 
@@ -255,6 +262,103 @@ What you implemented for history / provider seam, and what you left out.
   DTO layer (the controller returns the records, whose shape is the API); changing any behaviour,
   including the quirks above.
 
+### Richer history filters
+
+- **What it does:** `/history` filters by category, provider, request (a request id in the table
+  drills down), scope (a request / no request), time (presets or custom days), confidence
+  (presets) and message text, all combined with AND. Category and provider show how many rows each
+  choice would give, and the table loads more pages on demand. The filters live in the URL, so a
+  filtered view can be shared, reloaded and stepped through with the back button.
+- **API semantics** (`GET /requests/history`, and `GET /requests/history/facets` for the counts):
+  `from` is inclusive and `to` exclusive, so adjacent ranges neither overlap nor drop the boundary
+  row. `minConfidence` / `maxConfidence` are inclusive, within 0..1. `q` is a case-insensitive
+  substring of the classified text (`ILIKE`, with `%`, `_` and `\` escaped so they are literal), 1
+  to 100 characters after trimming; it is not a word or full-text search. `requestId` with
+  `adHoc=true`, `from` >= `to` and `minConfidence` > `maxConfidence` are 400s (`adHoc=false` with a
+  `requestId` is redundant, not wrong). `total` counts every match, not the page.
+- **Paging:** keyset, not offset, so a page costs the same however deep it is (80,000 rows in:
+  5.6 ms) and rows arriving at the top do not shift a page in progress. The cursor is the last
+  row's id, and Postgres decides "after that row" (`(created_at, id) < (SELECT ... WHERE id =
+  :cursor)`). A cursor that carried the timestamp would be cut to milliseconds by a JS `Date`
+  while Postgres keeps microseconds, so rows created in the same millisecond could be skipped or
+  repeated; the paging tests include rows that differ only in the microseconds. A cursor that
+  points at no row is a 400, not an empty last page.
+- **Facets:** each facet ignores its own filter (choosing "billing" still shows the other
+  categories' counts, as they would be if you switched), all four categories are listed even at 0,
+  and providers sort by count, then name. It costs two `GROUP BY` scans (~12 ms at 200k rows).
+- **Index and search, measured on 200,000 rows before adding anything:** one index was worth it,
+  `(provider, created_at DESC, id DESC)` (migration `1789836981276-ClassificationHistoryProviderIndex`).
+  A provider with 0.5% of the rows, spread over time, was already fine on the existing index
+  (0.5 ms). The bad case is a provider whose few rows are all old, such as one that has been
+  replaced: newest-first order cannot find them without reading everything newer, so Postgres
+  scanned the whole table (6.6 ms, growing with it) against 0.05 ms and constant with the index.
+  Everything else rides the existing indexes or scans cheaply (median of seven HTTP calls, warm
+  cache: first page 4.9 ms, category 3.7, ad hoc 1.4, last 24 h 1.0, low confidence 7.4). Search
+  is the slow one (31 ms for a common word, 47 ms for no match, since it scans the table). A
+  `pg_trgm` GIN index took the count from 80 ms to 4 ms for a common word and from 33 ms to 0.02 ms
+  for no match, and I did not add it: it needs an extension (privileges on managed Postgres),
+  every classify write would pay for an index on free text, and 30-50 ms at this size is
+  acceptable. Search grows with the table, so add it when it stops being (a linear guess: about a
+  second at 4 million rows). `total` and the facets are scans that grow with the matches; the
+  remedy is the one in "Classification history scope" (a "has more" flag, estimated or cached counts).
+- **Sequencing:**
+  1. *Migration first.* It only adds an index, so the old API ignores it, and `down` drops it. It
+     builds inside the migration's transaction, which blocks inserts into `classification_history`
+     while it runs; on a big table that would need `CREATE INDEX CONCURRENTLY` in a migration with
+     `transaction = false`, since Postgres refuses it inside a transaction. The api container
+     migrates at boot, so a rolling deploy must finish migrating before new instances take traffic.
+  2. *API before web.* The new API is a superset: the old parameters behave the same and the
+     response only gains `nextCursor`, which the old page ignores. The other order is worse: an old
+     API silently drops filters it does not know (checked against the previous build: a
+     `provider`, a `q` and a `minConfidence` that match nothing still returned all 131 rows, and
+     `/facets` is a 404), so a new page would present unfiltered rows as filtered and could not
+     page.
+  3. *Rollback* is the reverse: web, then API; the index can stay, it is harmless.
+- **The URL is the state.** `parseFilters` keeps only values the API would accept and drops the
+  rest, so a hand-edited or stale URL cannot break the page or send garbage (the API is strict on
+  its own regardless). A request id beats "ad hoc only" when both are in a URL, since the pair would
+  be a 400; choosing a scope drops the request, and drilling into a request drops "ad hoc only".
+- **Time:** presets (24 h, 7 d, 30 d) are resolved to `from` when the request is sent, and they
+  exclude custom days (choosing one clears the other; a URL with both keeps the preset). Custom
+  From / To are the viewer's local days, and "To" is shown as included, so it is sent as the start
+  of the next local day (the API's `to` is exclusive). The API only takes instants, so what
+  counts as "a day" is decided by the browser, and two viewers in different zones see different days.
+- **Confidence is three presets, not number boxes:** high >= 0.8, medium 0.6 to 0.79, low <= 0.59.
+  Known limit: the cuts are at two decimals and the column is a `double`, so a confidence strictly
+  between 0.79 and 0.8 (or 0.59 and 0.6) matches no preset (it still shows under "Any"). Today's
+  classifier and rules only produce 0.86, 0.8, 0.78, 0.4 and their softened values, and no stored
+  row is in a gap, but a provider with finer confidences would need an exclusive upper bound
+  (`[min, max)`, like `from` / `to`) so the presets partition the range.
+- **Found by driving a real browser (mine, since fixed):** two quick changes (From, then To)
+  overwrote each other, because handlers built the next URL from the render's filters before the
+  previous change had landed; updates are now functions of the latest filters. The infinite query
+  is `gcTime: 0`, since a cached one showed 130 old rows after "Clear all" and would refetch every
+  loaded page once stale. The back button skipped filter changes while everything used `replace`;
+  discrete changes now push, and only the debounced search (300 ms) replaces, so typing does not
+  leave an entry per pause. Wrapping a `<select>` in its `<label>` gave the label the text of every
+  option as its name; the labels now use `htmlFor`.
+- **Web tests:** `apps/web` now has vitest (Node only, no DOM) with 49 tests of the pure filter
+  module: parsing, serialising, presets, day boundaries, the contradiction rules. The page itself
+  is covered by browser scripts that are not committed. The lockfile gains one line. I first let
+  npm pick 4.1.11, which also bumped the API's vitest and rewrote 349 lines of the lock, and
+  reverted to the exact 4.1.10 the API already uses.
+- **Verification:** (a) the API against independent SQL on 200,000 rows: totals, first-page ids and
+  next-page flags for 12 filter combinations; a walk of 136 pages of 37 rows in the exact SQL order
+  with no gaps or repeats; facets equal `GROUP BY`; 18 invalid inputs each got one precise 400; the
+  old parameters returned the previous commit's bytes apart from the new `nextCursor`. (b) 22
+  injected bugs (bounds off by one, scope swapped, case-sensitive search, unescaped wildcards,
+  cursor direction, no look-ahead row, `total` from the page, an ignored filter, a facet applying its
+  own filter, the DTO and service checks, the web's day boundaries and preset edges), each caught by
+  a test. (c) Headless Chrome on 130 controlled rows: counts on the chips equal SQL, every control,
+  the debounce race, back button, shared URL, reload, hostile URL, empty state, drill-down, no
+  clipped table at 1200 px and a sideways scroll at 700 px; the Requests page scripts from earlier
+  tasks still pass. (d) The CI replay passes on npm 10.8.2 with the lockfile untouched by `npm ci`,
+  the migrations run on an empty database, and 239 tests (190 API, 49 web). The scripts are not
+  committed.
+- **Not done:** choosing several categories or providers at once; other sort orders; saved
+  filters and export; word or full-text search and the trigram index above; DOM-level component
+  tests; estimated totals. A retention policy for ad-hoc text is still open.
+
 ## What you would do with more time
 
 - Real pagination for `GET /requests` (keyset on `created_at, id`) with a way to see rows beyond
@@ -263,10 +367,12 @@ What you implemented for history / provider seam, and what you left out.
   scale.
 - Add the `(request_id, created_at DESC)` index if notes per request grow enough for the
   latest-note lookup to show up in `EXPLAIN`.
-- Add a web test runner and cover the status / classify cache behaviour and the history page.
-  Now that history exists, invalidate `['history']` when a classification finishes if navigation
-  becomes client-side; today the nav uses plain `<a>` links, so every navigation is a full reload.
+- Extend the web tests (vitest now covers only the pure history filter logic) with a DOM
+  environment, to cover the status / classify cache behaviour and the pages. Invalidate
+  `['history']` when a classification finishes if navigation becomes client-side; today the nav
+  uses plain `<a>` links, so every navigation is a full reload.
 - Give `create` and `updateStatus` the same DTO treatment (an invalid status is currently
   stored as-is), then consider a global `ValidationPipe`.
-- History: keyset pagination, date-range and provider filters, a drill-down from a request, a
-  retention policy for ad-hoc text, and an estimated `total` once the table is large.
+- History: a retention policy for ad-hoc text, an estimated `total` and cached facets once the
+  table is large, the trigram index if search gets slow, and half-open confidence buckets if a
+  provider reports finer confidences.

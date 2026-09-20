@@ -10,16 +10,18 @@ describe('RequestsController', () => {
   const list = vi.fn().mockResolvedValue([]);
   const classify = vi.fn();
   const listHistory = vi.fn();
+  const historyFacets = vi.fn();
   const controller = new RequestsController(
     { list } as unknown as RequestsService,
     { classify } as unknown as ClassificationService,
-    { list: listHistory } as unknown as ClassificationHistoryService,
+    { list: listHistory, facets: historyFacets } as unknown as ClassificationHistoryService,
   );
 
   beforeEach(() => {
     list.mockClear();
     classify.mockReset();
     listHistory.mockReset();
+    historyFacets.mockReset();
   });
 
   describe('list', () => {
@@ -50,11 +52,22 @@ describe('RequestsController', () => {
   describe('history', () => {
     it('delegates the query to the history service and returns its page', async () => {
       const query = { category: 'billing' as const, limit: 5 };
-      const page = { items: [], total: 0 };
+      const page = { items: [], total: 0, nextCursor: null };
       listHistory.mockResolvedValue(page);
 
       expect(await controller.history(query)).toBe(page);
       expect(listHistory).toHaveBeenCalledWith(query);
+    });
+  });
+
+  describe('historyFacets', () => {
+    it('delegates the filters to the history service and returns its facets', async () => {
+      const filters = { category: 'billing' as const, provider: 'keyword' };
+      const facets = { category: [], provider: [] };
+      historyFacets.mockResolvedValue(facets);
+
+      expect(await controller.historyFacets(filters)).toBe(facets);
+      expect(historyFacets).toHaveBeenCalledWith(filters);
     });
   });
 });

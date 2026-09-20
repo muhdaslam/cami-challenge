@@ -1,74 +1,81 @@
 'use client';
 
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { useState } from 'react';
+import { keepPreviousData, useInfiniteQuery, useQuery } from '@tanstack/react-query';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
+import { Suspense, useCallback, useEffect, useMemo, useRef } from 'react';
+import { fetchHistory, fetchHistoryFacets } from '@/lib/api';
 import {
-  CLASSIFICATION_CATEGORIES,
-  ClassificationCategory,
-  ClassificationHistoryItem,
-  fetchHistory,
-} from '@/lib/api';
+  activeFilters,
+  HistoryFilters,
+  parseFilters,
+  toApiParams,
+  toSearchParams,
+  withRequest,
+} from '@/lib/history-filters';
+import { FilterPanel } from './filter-panel';
+import { HistoryTable } from './history-table';
 
-// Full class names on purpose: Tailwind only generates classes it can find in the source.
-const CATEGORY_STYLES: Record<ClassificationCategory, string> = {
-  billing: 'bg-amber-100 text-amber-800',
-  sales: 'bg-emerald-100 text-emerald-800',
-  support: 'bg-sky-100 text-sky-800',
-  unknown: 'bg-slate-100 text-slate-600',
-};
-
-function HistoryRow({ item }: { item: ClassificationHistoryItem }) {
-  const percent = Math.round(item.confidence * 100);
-
+// useSearchParams needs a Suspense boundary above it, or the page cannot be built ahead of time.
+export default function HistoryPage() {
   return (
-    <tr>
-      <td className="whitespace-nowrap px-4 py-3 text-slate-600">
-        {new Date(item.createdAt).toLocaleString()}
-      </td>
-      <td className="px-4 py-3">
-        <span
-          className={`rounded-full px-2 py-0.5 text-xs font-medium ${CATEGORY_STYLES[item.category]}`}
-        >
-          {item.category}
-        </span>
-      </td>
-      <td className="px-4 py-3">
-        <div className="flex items-center gap-2">
-          <div className="h-1.5 w-16 overflow-hidden rounded-full bg-slate-100">
-            <div className="h-full rounded-full bg-slate-700" style={{ width: `${percent}%` }} />
-          </div>
-          <span className="tabular-nums text-slate-700">{percent}%</span>
-        </div>
-      </td>
-      {/* Takes the width the other columns leave and truncates; scrolls sideways when too narrow. */}
-      <td className="w-full min-w-[12rem] max-w-0 px-4 py-3">
-        <div className="truncate text-slate-900" title={item.message}>
-          {item.message}
-        </div>
-      </td>
-      <td className="px-4 py-3 font-mono text-xs text-slate-600">{item.provider}</td>
-      <td className="px-4 py-3 font-mono text-xs text-slate-600">
-        {item.requestId ? (
-          <span title={item.requestId}>{item.requestId.slice(0, 8)}</span>
-        ) : (
-          <span className="font-sans text-slate-400">ad hoc</span>
-        )}
-      </td>
-    </tr>
+    <Suspense fallback={<p className="text-slate-600">Loading history…</p>}>
+      <HistoryView />
+    </Suspense>
   );
 }
 
-export default function HistoryPage() {
-  const [category, setCategory] = useState<ClassificationCategory | ''>('');
-  const historyQuery = useQuery({
-    queryKey: ['history', category],
-    queryFn: () => fetchHistory(category || undefined),
+function HistoryView() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const urlKey = useSearchParams().toString();
+
+  // The filters live in the URL: a view can be shared or bookmarked, and survives a reload
+  // and the back button.
+  const filters = useMemo(() => parseFilters(new URLSearchParams(urlKey)), [urlKey]);
+  // "The last 24 hours" becomes a moment once per URL, so every page of results shares it.
+  const apiParams = useMemo(() => toApiParams(filters, new Date()), [filters]);
+
+  // The URL takes a moment to catch up with a change. Changes made in that moment (two clicks
+  // in quick succession) must build on each other, not on the URL they both started from, so
+  // each change is a function of the latest filters asked for.
+  //
+  // A change is a step in the browser history, so the back button undoes it. Search is the
+  // exception (see FilterPanel): it replaces the entry, or every pause in typing would leave one.
+  const latest = useRef(filters);
+  useEffect(() => {
+    latest.current = filters;
+  }, [filters]);
+  const updateFilters = useCallback(
+    (change: (current: HistoryFilters) => HistoryFilters, options?: { replace?: boolean }) => {
+      const next = change(latest.current);
+      latest.current = next;
+      const query = toSearchParams(next).toString();
+      const go = options?.replace ? router.replace : router.push;
+      go(query ? `${pathname}?${query}` : pathname, { scroll: false });
+    },
+    [router, pathname],
+  );
+
+  const history = useInfiniteQuery({
+    queryKey: ['history', urlKey],
+    queryFn: ({ pageParam }) => fetchHistory(apiParams, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
     // Keep the old rows on screen while a new filter loads, instead of flashing "Loading".
+    placeholderData: keepPreviousData,
+    // A view starts from its first page every time. Cached, the pages of a long list that was
+    // loaded page by page would all be fetched again, one after another, once they go stale.
+    gcTime: 0,
+  });
+  const facets = useQuery({
+    queryKey: ['history-facets', urlKey],
+    queryFn: () => fetchHistoryFacets(apiParams),
     placeholderData: keepPreviousData,
   });
 
-  const page = historyQuery.data;
-  const inCategory = category ? ` in ${category}` : '';
+  const items = history.data?.pages.flatMap((page) => page.items) ?? [];
+  const total = history.data?.pages[0]?.total ?? 0;
+  const filtered = activeFilters(filters).length > 0;
 
   return (
     <div className="space-y-6">
@@ -80,64 +87,57 @@ export default function HistoryPage() {
         </p>
       </div>
 
-      <label className="flex max-w-xs flex-col gap-1 text-sm">
-        <span className="font-medium text-slate-700">Category</span>
-        <select
-          className="rounded border border-slate-300 bg-white px-3 py-2"
-          value={category}
-          onChange={(e) => setCategory(e.target.value as ClassificationCategory | '')}
-        >
-          <option value="">All categories</option>
-          {CLASSIFICATION_CATEGORIES.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </select>
-      </label>
+      <FilterPanel filters={filters} facets={facets.data} onChange={updateFilters} />
 
-      {historyQuery.isError ? (
+      {history.isError ? (
         <p className="text-red-700">Could not load the classification history.</p>
-      ) : !page ? (
+      ) : !history.data ? (
         <p className="text-slate-600">Loading history…</p>
-      ) : page.items.length === 0 ? (
+      ) : items.length === 0 ? (
         <div className="rounded-lg border border-dashed border-slate-300 bg-white p-6 text-sm text-slate-600">
-          <p>No classifications{inCategory} yet.</p>
-          <p className="mt-1">
-            Use Classify on the <a className="underline" href="/">Requests</a> page and they will
-            show up here.
-          </p>
+          {filtered ? (
+            <>
+              <p>No classifications match these filters.</p>
+              <button
+                type="button"
+                className="mt-1 underline hover:text-slate-900"
+                onClick={() => updateFilters(() => ({}))}
+              >
+                Clear all filters
+              </button>
+            </>
+          ) : (
+            <>
+              <p>No classifications yet.</p>
+              <p className="mt-1">
+                Use Classify on the <a className="underline" href="/">Requests</a> page and they
+                will show up here.
+              </p>
+            </>
+          )}
         </div>
       ) : (
-        <div className="space-y-2">
-          <p className="text-sm text-slate-600">
-            {page.items.length < page.total
-              ? `Showing the latest ${page.items.length} of ${page.total}${inCategory}`
-              : `${page.total} classification${page.total === 1 ? '' : 's'}${inCategory}`}
+        <div className="space-y-3">
+          <p className="text-sm text-slate-600" aria-live="polite">
+            {items.length < total
+              ? `Showing ${items.length} of ${total}${filtered ? ' matching the filters' : ''}`
+              : `${total} classification${total === 1 ? '' : 's'}${filtered ? ' matching the filters' : ''}`}
           </p>
-          <div
-            className={`overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm ${
-              historyQuery.isPlaceholderData ? 'opacity-60' : ''
-            }`}
-          >
-            <table className="min-w-full divide-y divide-slate-200 text-sm">
-              <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-                <tr>
-                  <th className="px-4 py-3">When</th>
-                  <th className="px-4 py-3">Category</th>
-                  <th className="px-4 py-3">Confidence</th>
-                  <th className="px-4 py-3">Message</th>
-                  <th className="px-4 py-3">Provider</th>
-                  <th className="px-4 py-3">Request</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {page.items.map((item) => (
-                  <HistoryRow key={item.id} item={item} />
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <HistoryTable
+            items={items}
+            dimmed={history.isPlaceholderData}
+            onSelectRequest={(requestId) => updateFilters((current) => withRequest(current, requestId))}
+          />
+          {history.hasNextPage && (
+            <button
+              type="button"
+              className="rounded border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 hover:bg-slate-50 disabled:opacity-50"
+              disabled={history.isFetchingNextPage}
+              onClick={() => history.fetchNextPage()}
+            >
+              {history.isFetchingNextPage ? 'Loading…' : `Load more (${total - items.length} more)`}
+            </button>
+          )}
         </div>
       )}
     </div>

@@ -11,10 +11,10 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import { ClassificationHistoryService } from './classification-history.service';
-import { ClassificationHistoryPage } from './classification-log';
+import { ClassificationHistoryFacets, ClassificationHistoryPage } from './classification-log';
 import { ClassificationService } from './classification.service';
 import { ClassifyRequestDto, ClassifyResponse } from './classify.dto';
-import { HistoryQueryDto } from './history-query.dto';
+import { HistoryFilterDto, HistoryQueryDto } from './history-query.dto';
 import { RequestStatus } from './request-model';
 import { RequestsService } from './requests.service';
 
@@ -42,6 +42,12 @@ export class RequestsController {
   @Get('history')
   history(@Query(dtoPipe) query: HistoryQueryDto): Promise<ClassificationHistoryPage> {
     return this.classificationHistory.list(query);
+  }
+
+  // The counts behind the history filters, for the same filters as the list.
+  @Get('history/facets')
+  historyFacets(@Query(dtoPipe) query: HistoryFilterDto): Promise<ClassificationHistoryFacets> {
+    return this.classificationHistory.facets(query);
   }
 
   @Get(':id')

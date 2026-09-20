@@ -93,21 +93,44 @@ export type ClassificationHistoryPage = {
   items: ClassificationHistoryItem[];
   // Every match, not only the rows returned.
   total: number;
+  // Pass it back to get the next page; null on the last one.
+  nextCursor: string | null;
 };
 
-// The history table shows this many rows.
+export type FacetCount<T extends string = string> = { value: T; count: number };
+
+// How many classifications match per value, under every filter except that facet's own.
+export type ClassificationHistoryFacets = {
+  category: FacetCount<ClassificationCategory>[];
+  provider: FacetCount[];
+};
+
+// The history table loads this many rows at a time.
 export const HISTORY_LIMIT = 50;
 
+// `filters` are the API's own parameter names; see toApiParams in history-filters.ts.
 export async function fetchHistory(
-  category?: ClassificationCategory,
+  filters: URLSearchParams,
+  cursor?: string,
 ): Promise<ClassificationHistoryPage> {
-  const params = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
-  if (category) {
-    params.set('category', category);
+  const params = new URLSearchParams(filters);
+  params.set('limit', String(HISTORY_LIMIT));
+  if (cursor) {
+    params.set('cursor', cursor);
   }
   const res = await fetch(`${API_URL}/requests/history?${params}`);
   if (!res.ok) {
     throw new Error(`Failed to load history (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function fetchHistoryFacets(
+  filters: URLSearchParams,
+): Promise<ClassificationHistoryFacets> {
+  const res = await fetch(`${API_URL}/requests/history/facets?${filters}`);
+  if (!res.ok) {
+    throw new Error(`Failed to load history filters (${res.status})`);
   }
   return res.json();
 }

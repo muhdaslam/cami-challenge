@@ -2,7 +2,11 @@ import 'reflect-metadata';
 import { DataSource } from 'typeorm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createDataSource } from '../src/data-source';
-import { ClassificationEntry, RequestNotFoundError } from '../src/requests/classification-log';
+import {
+  ClassificationEntry,
+  InvalidCursorError,
+  RequestNotFoundError,
+} from '../src/requests/classification-log';
 import { ClassificationCategory } from '../src/requests/classification-provider';
 import { ClassificationRecord } from '../src/requests/classification-record.entity';
 import { ClassificationService } from '../src/requests/classification.service';
@@ -181,6 +185,232 @@ describe.skipIf(!process.env.DATABASE_URL)('TypeOrmClassificationLog (Postgres)'
 
       expect(page.items.map((item) => item.category)).toEqual(['unknown', 'support']);
       expect(page.total).toBe(4);
+    });
+  });
+
+  // Filters, paging and facets. Every row carries this run's TAG, in its message and in its
+  // provider, so the assertions hold whatever else is in the table.
+  describe('filters, paging and facets', () => {
+    const TAG = Date.now().toString(36);
+    const P1 = `test-${TAG}-a`;
+    const P2 = `test-${TAG}-b`;
+    const T0 = Date.parse('2031-01-01T00:00:00Z');
+    const at = (hours: number) => new Date(T0 + hours * 3_600_000);
+    const row: Record<'r1' | 'r2' | 'r3' | 'r4' | 'r5', string> = {} as never;
+    let linked: string;
+    let otherLinked: string;
+
+    async function insertRow(values: {
+      requestId: string | null;
+      text: string;
+      category: ClassificationCategory;
+      confidence: number;
+      provider: string;
+      createdAt: Date | string;
+      // False keeps the row out of `text: TAG` searches (the paging fixtures are found by provider).
+      tagged?: boolean;
+    }): Promise<string> {
+      const [{ id }] = await ds.query<{ id: string }[]>(
+        `INSERT INTO classification_history (request_id, message, category, confidence, provider, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id`,
+        [
+          values.requestId,
+          `${PREFIX} ${values.tagged === false ? '' : `${TAG} `}${values.text}`,
+          values.category,
+          values.confidence,
+          values.provider,
+          values.createdAt,
+        ],
+      );
+      return id;
+    }
+
+    const idsOf = async (query: Partial<Parameters<typeof log.list>[0]>) =>
+      (await log.list({ limit: 50, ...query })).items.map((item) => item.id);
+
+    beforeAll(async () => {
+      linked = await insertRequest();
+      otherLinked = await insertRequest();
+      const base = { confidence: 0.8, category: 'billing' as ClassificationCategory };
+      row.r1 = await insertRow({ ...base, requestId: linked, text: 'Refund did not arrive', confidence: 0.86, provider: P1, createdAt: at(1) });
+      row.r2 = await insertRow({ ...base, requestId: linked, text: 'Interested in a DEMO', category: 'sales', confidence: 0.65, provider: P1, createdAt: at(2) });
+      row.r3 = await insertRow({ ...base, requestId: null, text: 'login is broken', category: 'support', confidence: 0.63, provider: P1, createdAt: at(3) });
+      row.r4 = await insertRow({ ...base, requestId: null, text: '100% wrong_input', category: 'unknown', confidence: 0.4, provider: P2, createdAt: at(4) });
+      row.r5 = await insertRow({ ...base, requestId: otherLinked, text: 'other refund', confidence: 0.9, provider: P2, createdAt: at(5) });
+    });
+
+    describe('filters', () => {
+      it('filters by provider', async () => {
+        const page = await log.list({ provider: P1, limit: 50 });
+
+        expect(page.items.map((item) => item.id)).toEqual([row.r3, row.r2, row.r1]);
+        expect(page.total).toBe(3);
+      });
+
+      it('filters to ad-hoc or to request-linked classifications', async () => {
+        expect(await idsOf({ text: TAG, adHoc: true })).toEqual([row.r4, row.r3]);
+        expect(await idsOf({ text: TAG, adHoc: false })).toEqual([row.r5, row.r2, row.r1]);
+      });
+
+      it('filters by time: from is included, to is not', async () => {
+        expect(await idsOf({ provider: P1, from: at(2), to: at(3) })).toEqual([row.r2]);
+        expect(await idsOf({ provider: P1, from: at(2) })).toEqual([row.r3, row.r2]);
+        expect(await idsOf({ provider: P1, to: at(2) })).toEqual([row.r1]);
+      });
+
+      it('filters by confidence, bounds included', async () => {
+        expect(await idsOf({ provider: P1, maxConfidence: 0.65 })).toEqual([row.r3, row.r2]);
+        expect(await idsOf({ provider: P1, minConfidence: 0.65 })).toEqual([row.r2, row.r1]);
+        expect(await idsOf({ provider: P1, minConfidence: 0.63, maxConfidence: 0.65 })).toEqual([row.r3, row.r2]);
+      });
+
+      it('searches the text without regard to case', async () => {
+        expect(await idsOf({ provider: P1, text: 'refund' })).toEqual([row.r1]);
+        expect(await idsOf({ provider: P1, text: 'demo' })).toEqual([row.r2]);
+      });
+
+      it('takes % and _ in a search literally', async () => {
+        expect(await idsOf({ provider: P2, text: '%' })).toEqual([row.r4]);
+        expect(await idsOf({ provider: P2, text: '_' })).toEqual([row.r4]);
+        expect(await idsOf({ provider: P2, text: '100% wrong_' })).toEqual([row.r4]);
+        // As a wildcard, "_" would match the "d" of "refund".
+        expect(await idsOf({ provider: P2, text: 'refun_' })).toEqual([]);
+      });
+
+      it('combines filters', async () => {
+        expect(await idsOf({ provider: P1, category: 'billing', adHoc: false })).toEqual([row.r1]);
+        expect(await idsOf({ text: TAG, category: 'billing', minConfidence: 0.88 })).toEqual([row.r5]);
+        expect(await idsOf({ requestId: linked, text: TAG })).toEqual([row.r2, row.r1]);
+      });
+    });
+
+    describe('paging', () => {
+      it('follows the cursor through a filter, and total stays the same', async () => {
+        const first = await log.list({ provider: P1, limit: 2 });
+        expect(first.items.map((item) => item.id)).toEqual([row.r3, row.r2]);
+        expect(first).toMatchObject({ total: 3, nextCursor: row.r2 });
+
+        const second = await log.list({ provider: P1, limit: 2, cursor: first.nextCursor! });
+        expect(second.items.map((item) => item.id)).toEqual([row.r1]);
+        expect(second).toMatchObject({ total: 3, nextCursor: null });
+      });
+
+      it('has no next page when the results fit exactly', async () => {
+        expect((await log.list({ provider: P1, limit: 3 })).nextCursor).toBeNull();
+      });
+
+      it('keeps the filters from page to page', async () => {
+        const first = await log.list({ text: TAG, category: 'billing', limit: 1 });
+        const second = await log.list({ text: TAG, category: 'billing', limit: 1, cursor: first.nextCursor! });
+
+        expect([first.items[0].id, second.items[0].id]).toEqual([row.r5, row.r1]);
+        expect(second.nextCursor).toBeNull();
+      });
+
+      it('walks rows with the same created_at without gaps or repeats', async () => {
+        const provider = `test-${TAG}-tie`;
+        const same = at(10);
+        const ids = [];
+        for (let i = 0; i < 5; i += 1) {
+          ids.push(await insertRow({ requestId: null, text: `tie ${i}`, category: 'unknown', confidence: 0.4, provider, createdAt: same, tagged: false }));
+        }
+
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await log.list({ provider, limit: 2, cursor });
+          expect(page.total).toBe(5);
+          seen.push(...page.items.map((item) => item.id));
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+
+        expect(seen).toEqual([...ids].sort().reverse());
+      });
+
+      it('does not skip rows that differ only in the microseconds Postgres keeps', async () => {
+        const provider = `test-${TAG}-us`;
+        // Within one millisecond: a cursor that carried a JavaScript Date would lose these.
+        const stamps = ['.123001', '.123400', '.123456', '.123999'];
+        const ids = [];
+        for (const fraction of stamps) {
+          ids.push(await insertRow({ requestId: null, text: `us ${fraction}`, category: 'unknown', confidence: 0.4, provider, createdAt: `2031-02-01 00:00:00${fraction}+00`, tagged: false }));
+        }
+
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await log.list({ provider, limit: 1, cursor });
+          seen.push(...page.items.map((item) => item.id));
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+
+        expect(seen).toEqual([...ids].reverse());
+      });
+
+      it('answers an empty last page, not an error, for a cursor at the very end', async () => {
+        const page = await log.list({ provider: P1, limit: 5, cursor: row.r1 });
+
+        expect(page).toEqual({ items: [], total: 3, nextCursor: null });
+      });
+
+      it('rejects a cursor that points at nothing', async () => {
+        await expect(
+          log.list({ provider: P1, limit: 2, cursor: UNKNOWN_REQUEST }),
+        ).rejects.toBeInstanceOf(InvalidCursorError);
+      });
+    });
+
+    describe('facets', () => {
+      it('counts every category, and the providers, under the other filters', async () => {
+        const facets = await log.facets({ text: TAG });
+
+        expect(facets.category).toEqual([
+          { value: 'support', count: 1 },
+          { value: 'sales', count: 1 },
+          { value: 'billing', count: 2 },
+          { value: 'unknown', count: 1 },
+        ]);
+        expect(facets.provider).toEqual([
+          { value: P1, count: 3 },
+          { value: P2, count: 2 },
+        ]);
+      });
+
+      it('leaves a facet\'s own filter out, and applies the others to it', async () => {
+        const facets = await log.facets({ text: TAG, category: 'billing' });
+
+        // Categories: the category filter is left out, so the alternatives stay visible.
+        expect(facets.category.map((c) => c.count)).toEqual([1, 1, 2, 1]);
+        // Providers: only the billing rows count.
+        expect(facets.provider).toEqual([
+          { value: P1, count: 1 },
+          { value: P2, count: 1 },
+        ]);
+      });
+
+      it('lists a category with no matches as zero', async () => {
+        const facets = await log.facets({ text: TAG, provider: P1 });
+
+        expect(facets.category).toEqual([
+          { value: 'support', count: 1 },
+          { value: 'sales', count: 1 },
+          { value: 'billing', count: 1 },
+          { value: 'unknown', count: 0 },
+        ]);
+        // The provider filter is left out of the provider facet.
+        expect(facets.provider.map((p) => p.value)).toEqual([P1, P2]);
+      });
+
+      it('applies time and confidence filters to both facets', async () => {
+        const facets = await log.facets({ text: TAG, from: at(3) });
+
+        expect(facets.category.map((c) => c.count)).toEqual([1, 0, 1, 1]);
+        expect(facets.provider).toEqual([
+          { value: P2, count: 2 },
+          { value: P1, count: 1 },
+        ]);
+      });
     });
   });
 
