@@ -6,25 +6,27 @@ import {
   classifyMessage,
   createRequest,
   fetchRequests,
+  RequestListItem,
   RequestStatus,
   updateRequestStatus,
 } from '@/lib/api';
 
 const STATUSES: RequestStatus[] = ['open', 'in_progress', 'resolved'];
+const REQUESTS_KEY = ['requests'] as const;
 
 export default function HomePage() {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState('');
 
   const requestsQuery = useQuery({
-    queryKey: ['requests'],
+    queryKey: REQUESTS_KEY,
     queryFn: fetchRequests,
   });
 
   const createMutation = useMutation({
     mutationFn: (message: string) => createRequest(message),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['requests'] });
+      queryClient.invalidateQueries({ queryKey: REQUESTS_KEY });
       setDraft('');
     },
   });
@@ -32,11 +34,25 @@ export default function HomePage() {
   const statusMutation = useMutation({
     mutationFn: ({ id, status }: { id: string; status: RequestStatus }) =>
       updateRequestStatus(id, status),
+    // The <select> is driven by the cached list, so patch the row now; otherwise it snaps
+    // back to the old status until the refetch below lands.
+    onMutate: async ({ id, status }) => {
+      await queryClient.cancelQueries({ queryKey: REQUESTS_KEY });
+      queryClient.setQueryData<RequestListItem[]>(REQUESTS_KEY, (rows) =>
+        rows?.map((row) => (row.id === id ? { ...row, status } : row)),
+      );
+    },
+    // onSettled, not onSuccess: a failed update also resyncs with the server, which undoes
+    // the optimistic patch.
+    onSettled: () => queryClient.invalidateQueries({ queryKey: REQUESTS_KEY }),
   });
 
   const classifyMutation = useMutation({
     mutationFn: ({ id, message }: { id: string; message: string }) =>
       classifyMessage(message, id),
+    // The API decides category, confidence and the open -> in_progress transition, so
+    // refetch instead of guessing them client-side.
+    onSettled: () => queryClient.invalidateQueries({ queryKey: REQUESTS_KEY }),
   });
 
   if (requestsQuery.isLoading) {
@@ -101,7 +117,7 @@ export default function HomePage() {
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
-            {requests.slice(0, 25).map((row) => (
+            {requests.map((row) => (
               <tr key={row.id}>
                 <td className="max-w-md px-4 py-3">
                   <div className="font-medium text-slate-900">{row.message}</div>

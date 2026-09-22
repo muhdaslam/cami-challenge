@@ -1,34 +1,53 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
   Param,
+  ParseIntPipe,
   Patch,
   Post,
   Query,
+  ValidationPipe,
 } from '@nestjs/common';
+import { ClassificationHistoryService } from './classification-history.service';
+import { ClassificationHistoryFacets, ClassificationHistoryPage } from './classification-log';
+import { ClassificationService } from './classification.service';
+import { ClassifyRequestDto, ClassifyResponse } from './classify.dto';
+import { HistoryFilterDto, HistoryQueryDto } from './history-query.dto';
+import { RequestStatus } from './request-model';
 import { RequestsService } from './requests.service';
-import { KeywordClassifier } from './keyword-classifier';
-import { RequestStatus } from './customer-request.entity';
+
+// `transform` is what turns query strings into the numbers a DTO declares; `stopAtFirstError`
+// keeps the error body to one reason per field.
+const dtoPipe = new ValidationPipe({ whitelist: true, transform: true, stopAtFirstError: true });
 
 @Controller('requests')
 export class RequestsController {
   constructor(
     private readonly requestsService: RequestsService,
-    private readonly classifier: KeywordClassifier,
+    private readonly classification: ClassificationService,
+    private readonly classificationHistory: ClassificationHistoryService,
   ) {}
 
   @Get()
-  list() {
-    return this.requestsService.list();
+  list(@Query('limit', new ParseIntPipe({ optional: true })) limit?: number) {
+    if (limit !== undefined && limit < 1) {
+      throw new BadRequestException('limit must be a positive integer');
+    }
+    return this.requestsService.list(limit);
   }
 
+  // Declared before ':id' so "history" is not read as an id.
   @Get('history')
-  history(@Query('category') _category?: string) {
-    return {
-      items: [],
-      message: 'Classification history is not implemented yet.',
-    };
+  history(@Query(dtoPipe) query: HistoryQueryDto): Promise<ClassificationHistoryPage> {
+    return this.classificationHistory.list(query);
+  }
+
+  // The counts behind the history filters, for the same filters as the list.
+  @Get('history/facets')
+  historyFacets(@Query(dtoPipe) query: HistoryFilterDto): Promise<ClassificationHistoryFacets> {
+    return this.classificationHistory.facets(query);
   }
 
   @Get(':id')
@@ -52,51 +71,8 @@ export class RequestsController {
     return this.requestsService.updateStatus(id, body.status);
   }
 
-  /**
-   * Classify a customer request. Business rules currently live in the controller.
-   */
   @Post('classify')
-  async classify(@Body() body: any) {
-    const message = body?.message;
-    if (!message || typeof message !== 'string' || message.trim().length === 0) {
-      return { error: 'message must be a non-empty string' };
-    }
-
-    if (message.length > 2000) {
-      return { error: 'message too long' };
-    }
-
-    const trimmed = message.trim();
-    let result = this.classifier.classify(trimmed);
-
-    // Soften confidence for very short messages.
-    if (trimmed.split(/\s+/).length < 3 && result.category !== 'unknown') {
-      result = {
-        category: result.category,
-        confidence: Math.max(0.5, result.confidence - 0.15),
-      };
-    }
-
-    // Prefer "unknown" when confidence is weak.
-    if (result.confidence < 0.55) {
-      result = { category: 'unknown', confidence: result.confidence };
-    }
-
-    const requestId = body.requestId as string | undefined;
-    if (requestId) {
-      const existing: any = await this.requestsService.getById(requestId);
-      existing.category = result.category;
-      existing.confidence = result.confidence;
-      if (existing.status === 'open') {
-        existing.status = 'in_progress';
-      }
-      await this.requestsService.save(existing);
-    }
-
-    return {
-      category: result.category,
-      confidence: result.confidence,
-      requestId: requestId ?? null,
-    };
+  classify(@Body(dtoPipe) dto: ClassifyRequestDto): Promise<ClassifyResponse> {
+    return this.classification.classify(dto);
   }
 }

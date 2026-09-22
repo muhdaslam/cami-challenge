@@ -6,9 +6,8 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
+import { RequestStatus } from './request-model';
 import { RequestNote } from './request-note.entity';
-
-export type RequestStatus = 'open' | 'in_progress' | 'resolved';
 
 @Entity({ name: 'customer_requests' })
 export class CustomerRequest {
