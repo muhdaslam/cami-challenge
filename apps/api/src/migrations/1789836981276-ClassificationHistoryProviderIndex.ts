@@ -9,8 +9,10 @@ export class ClassificationHistoryProviderIndex1789836981276 implements Migratio
     // rows and growing, against 0.05 ms and constant with the index.
     //
     // A plain CREATE INDEX blocks inserts while it builds, which is instant at this size. On a
-    // big table build it with CREATE INDEX CONCURRENTLY, which cannot run inside the
-    // transaction TypeORM wraps a migration in, so that needs a migration of its own.
+    // big table build it with CREATE INDEX CONCURRENTLY (transaction = false on that migration),
+    // which cannot run inside the transaction TypeORM wraps a migration in. That alone is not
+    // enough: TypeORM's default migrationsTransactionMode ('all') forbids a migration overriding
+    // `transaction`, so the data source would also need migrationsTransactionMode: 'each'.
     await queryRunner.query(`
       CREATE INDEX IF NOT EXISTS idx_classification_history_provider_created_at
       ON classification_history(provider, created_at DESC, id DESC);

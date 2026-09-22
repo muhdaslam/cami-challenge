@@ -305,7 +305,11 @@ What you implemented for history / provider seam, and what you left out.
   1. *Migration first.* It only adds an index, so the old API ignores it, and `down` drops it. It
      builds inside the migration's transaction, which blocks inserts into `classification_history`
      while it runs; on a big table that would need `CREATE INDEX CONCURRENTLY` in a migration with
-     `transaction = false`, since Postgres refuses it inside a transaction. The api container
+     `transaction = false`, since Postgres refuses it inside a transaction. That alone is not
+     enough with TypeORM 0.3.31: its default `migrationsTransactionMode` is `'all'` (every pending
+     migration in one transaction), which throws `ForbiddenTransactionModeOverrideError` for a
+     migration that overrides `transaction`, so the data source also needs
+     `migrationsTransactionMode: 'each'` (checked in `MigrationExecutor.js`). The api container
      migrates at boot, so a rolling deploy must finish migrating before new instances take traffic.
   2. *API before web.* The new API is a superset: the old parameters behave the same and the
      response only gains `nextCursor`, which the old page ignores. The other order is worse: an old
